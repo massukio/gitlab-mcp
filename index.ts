@@ -11919,6 +11919,11 @@ async function startStreamableHTTPServer(): Promise<void> {
 
   const authTimeouts: Record<string, NodeJS.Timeout> = {};
 
+  // Inactivity timeouts for all transport sessions (regardless of auth mode).
+  // These are the source-of-truth for cleaning up streamableTransports entries
+  // when clients disconnect without sending DELETE /mcp.
+  const transportTimeouts: Record<string, NodeJS.Timeout> = {};
+
   // Configuration and limits
   const MAX_SESSIONS = Number.parseInt(process.env.MAX_SESSIONS || "1000", 10);
   const MAX_REQUESTS_PER_MINUTE = Number.parseInt(process.env.MAX_REQUESTS_PER_MINUTE || "60", 10);
@@ -12077,6 +12082,45 @@ async function startStreamableHTTPServer(): Promise<void> {
     if (timeout) {
       clearTimeout(timeout);
       delete authTimeouts[sessionId];
+    }
+  };
+
+  /**
+   * Set (or reset) an inactivity timer for a transport session.
+   * Applies to ALL modes — not just auth modes — so stale sessions are
+   * evicted from streamableTransports even when no auth timeout is set.
+   * The timer is reset on every request, so SESSION_TIMEOUT_SECONDS acts
+   * as an inactivity window rather than an absolute-age cap.
+   */
+  const setTransportTimeout = (sessionId: string) => {
+    const existing = transportTimeouts[sessionId];
+    if (existing) {
+      clearTimeout(existing);
+    }
+    transportTimeouts[sessionId] = setTimeout(() => {
+      delete transportTimeouts[sessionId];
+      const transport = streamableTransports[sessionId];
+      if (transport) {
+        logger.info(
+          `Session ${sessionId}: closing transport after ${SESSION_TIMEOUT_SECONDS}s of inactivity`
+        );
+        metrics.expiredSessions++;
+        transport.close().catch((err) => {
+          logger.error(`Error closing transport for inactive session ${sessionId}:`, err);
+        });
+      }
+    }, SESSION_TIMEOUT_SECONDS * 1000);
+  };
+
+  /**
+   * Cancel the inactivity timer for a transport session.
+   * Called from transport.onclose so we do not leak timer handles.
+   */
+  const clearTransportTimeout = (sessionId: string) => {
+    const t = transportTimeouts[sessionId];
+    if (t) {
+      clearTimeout(t);
+      delete transportTimeouts[sessionId];
     }
   };
 
@@ -12592,6 +12636,8 @@ async function startStreamableHTTPServer(): Promise<void> {
         if (sessionId && streamableTransports[sessionId]) {
           // Reuse existing transport for ongoing session
           transport = streamableTransports[sessionId];
+          // Reset the inactivity timer so active sessions are not evicted.
+          setTransportTimeout(sessionId);
 
           await transport.handleRequest(req, res, req.body);
         } else {
@@ -12603,6 +12649,11 @@ async function startStreamableHTTPServer(): Promise<void> {
               metrics.totalSessions++;
               metrics.activeSessions++;
               logger.warn(`Streamable HTTP session initialized: ${newSessionId}`);
+              // Start the inactivity clock for this transport. Applies in all
+              // modes — static token, REMOTE_AUTHORIZATION, GITLAB_MCP_OAUTH —
+              // so stale sessions are always evicted when clients disconnect
+              // without sending DELETE /mcp.
+              setTransportTimeout(newSessionId);
 
               // Store auth for newly created session in remote mode
               if (REMOTE_AUTHORIZATION && !authBySession[newSessionId]) {
@@ -12653,6 +12704,8 @@ async function startStreamableHTTPServer(): Promise<void> {
               logger.warn(`Streamable HTTP transport closed for session ${sid}, cleaning up`);
               delete streamableTransports[sid];
               metrics.activeSessions--;
+              // Cancel inactivity timer so we don't leak timer handles.
+              clearTransportTimeout(sid);
               if (REMOTE_AUTHORIZATION || GITLAB_MCP_OAUTH) {
                 cleanupSessionAuth(sid);
                 delete sessionRequestCounts[sid];
@@ -12809,6 +12862,9 @@ async function startStreamableHTTPServer(): Promise<void> {
     // Clear all timeouts
     Object.keys(authTimeouts).forEach(sessionId => {
       clearAuthTimeout(sessionId);
+    });
+    Object.keys(transportTimeouts).forEach(sessionId => {
+      clearTransportTimeout(sessionId);
     });
 
     clientPool.closeAll();
